@@ -27,8 +27,8 @@ from aiogram.types import (
     InlineKeyboardButton,
     LabeledPrice,
     PreCheckoutQuery,
-    InlineKeyboardBuilder,
 )
+from aiogram.utils.keyboard import InlineKeyboardBuilder  # ✅ Правильный импорт
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
