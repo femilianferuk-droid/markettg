@@ -44,8 +44,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_IDS = [7973988177]
 SUPPORT_USERNAME = "@VestSkypSupport"
 
-API_ID = 26410400
-API_HASH = "ccf62cda3e48f26df00c9f3b2f0fc615"
+API_ID = 32480523
+API_HASH = "147839735c9fa4e83451209e9b55cfc5"
 
 logging.basicConfig(level=logging.INFO)
 
