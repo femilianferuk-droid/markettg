@@ -1,0 +1,953 @@
+import asyncio
+import logging
+import os
+import re
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any, Tuple
+
+from aiogram import Bot, Dispatcher, types, F, Router
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    LabeledPrice, PreCheckoutQuery
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
+from aiogram.methods import DeleteWebhook
+
+from dotenv import load_dotenv
+
+import psycopg2
+import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.extensions import AsIs, register_adapter
+
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.errors import (
+    SessionPasswordNeededError, PhoneCodeInvalidError,
+    PasswordHashInvalidError, PhoneCodeExpiredError, FloodWaitError
+)
+
+load_dotenv()
+
+# --- ФИКС BIGINT ---
+def adapt_bigint(val):
+    return AsIs(str(val))
+
+register_adapter(int, adapt_bigint)
+
+# --- Конфигурация ---
+API_ID = 32480523
+API_HASH = "147839735c9fa4e83451209e9b55cfc5"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost/db")
+ADMIN_ID = 7973988177
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+db_pool: ThreadedConnectionPool = None
+
+# --- Инициализация БД ---
+def init_db():
+    global db_pool
+    url = DATABASE_URL.replace("postgresql://", "")
+    user_pass, host_db = url.split("@")
+    user, password = user_pass.split(":")
+    host_port, dbname = host_db.split("/")
+    host, port = host_port.split(":") if ":" in host_port else (host_port, "5432")
+    
+    db_pool = ThreadedConnectionPool(
+        minconn=2,
+        maxconn=10,
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        dbname=dbname
+    )
+    
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    balance FLOAT DEFAULT 0.0,
+                    total_purchases INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT UNIQUE NOT NULL,
+                    country TEXT NOT NULL,
+                    session_string TEXT,
+                    password_2fa TEXT,
+                    is_sold BOOLEAN DEFAULT FALSE,
+                    is_valid BOOLEAN DEFAULT TRUE,
+                    is_reserved BOOLEAN DEFAULT FALSE,
+                    reserved_until TIMESTAMP,
+                    reserved_by BIGINT,
+                    sold_to BIGINT,
+                    buy_price FLOAT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS purchases (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    account_id INTEGER NOT NULL,
+                    purchase_date TIMESTAMP DEFAULT NOW(),
+                    code_obtained BOOLEAN DEFAULT FALSE
+                )
+            """)
+            
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS price_settings (
+                    country TEXT PRIMARY KEY,
+                    buy_price FLOAT DEFAULT 100.0
+                )
+            """)
+            
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS media_settings (
+                    section TEXT PRIMARY KEY,
+                    file_id TEXT,
+                    file_type TEXT,
+                    caption TEXT
+                )
+            """)
+        conn.commit()
+    finally:
+        db_pool.putconn(conn)
+
+# --- Функции БД (синхронные, ИСПРАВЛЕННЫЕ) ---
+def get_user_sync(user_id: int) -> Optional[Dict[str, Any]]:
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+            return cur.fetchone()
+    finally:
+        db_pool.putconn(conn)
+
+def create_user_sync(user_id: int, username: str = None):
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (id, username) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (user_id, username)
+            )
+        conn.commit()
+    finally:
+        db_pool.putconn(conn)
+
+def update_balance_sync(user_id: int, amount: float) -> float:
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "UPDATE users SET balance = balance + %s WHERE id = %s",
+                (amount, user_id)
+            )
+            cur.execute("SELECT balance FROM users WHERE id = %s", (user_id,))
+            row = cur.fetchone()
+        conn.commit()
+        return row['balance'] if row else 0.0
+    finally:
+        db_pool.putconn(conn)
+
+def get_free_account_sync(country: str) -> Optional[Dict[str, Any]]:
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT * FROM accounts 
+                WHERE country = %s 
+                AND is_sold = FALSE 
+                AND is_valid = TRUE 
+                AND (is_reserved = FALSE OR reserved_until < NOW())
+                ORDER BY created_at ASC 
+                LIMIT 1
+                """,
+                (country,)
+            )
+            return cur.fetchone()
+    finally:
+        db_pool.putconn(conn)
+
+def reserve_account_sync(account_id: int, user_id: int) -> bool:
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE accounts 
+                SET is_reserved = TRUE, reserved_by = %s, reserved_until = %s
+                WHERE id = %s AND is_sold = FALSE AND is_valid = TRUE
+                """,
+                (user_id, datetime.utcnow() + timedelta(minutes=5), account_id)
+            )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        db_pool.putconn(conn)
+
+def release_account_sync(account_id: int):
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE accounts 
+                SET is_reserved = FALSE, reserved_by = NULL, reserved_until = NULL
+                WHERE id = %s
+                """,
+                (account_id,)
+            )
+        conn.commit()
+    finally:
+        db_pool.putconn(conn)
+
+def mark_account_sold_sync(account_id: int, user_id: int, price: float):
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE accounts 
+                SET is_sold = TRUE, is_reserved = FALSE, sold_to = %s, buy_price = %s
+                WHERE id = %s
+                """,
+                (user_id, price, account_id)
+            )
+            cur.execute(
+                "INSERT INTO purchases (user_id, account_id) VALUES (%s, %s)",
+                (user_id, account_id)
+            )
+            cur.execute(
+                "UPDATE users SET total_purchases = total_purchases + 1 WHERE id = %s",
+                (user_id,)
+            )
+        conn.commit()
+    finally:
+        db_pool.putconn(conn)
+
+def get_user_purchases_sync(user_id: int) -> List[Dict[str, Any]]:
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT p.*, a.phone, a.country, a.password_2fa
+                FROM purchases p
+                JOIN accounts a ON p.account_id = a.id
+                WHERE p.user_id = %s
+                ORDER BY p.purchase_date DESC
+                """,
+                (user_id,)
+            )
+            return cur.fetchall()
+    finally:
+        db_pool.putconn(conn)
+
+def get_price_sync(country: str) -> float:
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT buy_price FROM price_settings WHERE country = %s", (country,)
+            )
+            row = cur.fetchone()
+            return row['buy_price'] if row else 100.0
+    finally:
+        db_pool.putconn(conn)
+
+def set_price_sync(country: str, value: float):
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO price_settings (country, buy_price) VALUES (%s, %s)
+                ON CONFLICT (country) DO UPDATE SET buy_price = %s
+                """,
+                (country, value, value)
+            )
+        conn.commit()
+    finally:
+        db_pool.putconn(conn)
+
+def get_media_sync(section: str) -> Optional[Dict[str, Any]]:
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM media_settings WHERE section = %s", (section,)
+            )
+            return cur.fetchone()
+    finally:
+        db_pool.putconn(conn)
+
+def set_media_sync(section: str, file_id: str, file_type: str, caption: str = None):
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO media_settings (section, file_id, file_type, caption) 
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (section) DO UPDATE 
+                SET file_id = %s, file_type = %s, caption = %s
+                """,
+                (section, file_id, file_type, caption, file_id, file_type, caption)
+            )
+        conn.commit()
+    finally:
+        db_pool.putconn(conn)
+
+def get_all_users_sync() -> List[Dict[str, Any]]:
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM users")
+            return cur.fetchall()
+    finally:
+        db_pool.putconn(conn)
+
+def get_stats_sync() -> Dict[str, Any]:
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM users")
+            total_users = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM accounts")
+            total_accounts = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM accounts WHERE is_sold = TRUE")
+            sold_accounts = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM accounts WHERE is_sold = FALSE AND is_valid = TRUE")
+            available_accounts = cur.fetchone()[0]
+        return {
+            "total_users": total_users,
+            "total_accounts": total_accounts,
+            "sold_accounts": sold_accounts,
+            "available_accounts": available_accounts
+        }
+    finally:
+        db_pool.putconn(conn)
+
+def get_account_by_id_sync(account_id: int) -> Optional[Dict[str, Any]]:
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM accounts WHERE id = %s", (account_id,))
+            return cur.fetchone()
+    finally:
+        db_pool.putconn(conn)
+
+def mark_code_obtained_sync(purchase_id: int):
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE purchases SET code_obtained = TRUE WHERE id = %s",
+                (purchase_id,)
+            )
+        conn.commit()
+    finally:
+        db_pool.putconn(conn)
+
+# --- Асинхронные обертки ---
+async def get_user(user_id: int):
+    return await asyncio.to_thread(get_user_sync, user_id)
+
+async def create_user(user_id: int, username: str = None):
+    return await asyncio.to_thread(create_user_sync, user_id, username)
+
+async def update_balance(user_id: int, amount: float) -> float:
+    return await asyncio.to_thread(update_balance_sync, user_id, amount)
+
+async def get_free_account(country: str):
+    return await asyncio.to_thread(get_free_account_sync, country)
+
+async def reserve_account(account_id: int, user_id: int) -> bool:
+    return await asyncio.to_thread(reserve_account_sync, account_id, user_id)
+
+async def release_account(account_id: int):
+    return await asyncio.to_thread(release_account_sync, account_id)
+
+async def mark_account_sold(account_id: int, user_id: int, price: float):
+    return await asyncio.to_thread(mark_account_sold_sync, account_id, user_id, price)
+
+async def get_user_purchases(user_id: int):
+    return await asyncio.to_thread(get_user_purchases_sync, user_id)
+
+async def get_price(country: str) -> float:
+    return await asyncio.to_thread(get_price_sync, country)
+
+async def set_price(country: str, value: float):
+    return await asyncio.to_thread(set_price_sync, country, value)
+
+async def get_media(section: str):
+    return await asyncio.to_thread(get_media_sync, section)
+
+async def set_media(section: str, file_id: str, file_type: str, caption: str = None):
+    return await asyncio.to_thread(set_media_sync, section, file_id, file_type, caption)
+
+async def get_all_users():
+    return await asyncio.to_thread(get_all_users_sync)
+
+async def get_stats():
+    return await asyncio.to_thread(get_stats_sync)
+
+async def get_account_by_id(account_id: int):
+    return await asyncio.to_thread(get_account_by_id_sync, account_id)
+
+async def mark_code_obtained(purchase_id: int):
+    return await asyncio.to_thread(mark_code_obtained_sync, purchase_id)
+
+# --- Telethon функции ---
+async def check_account_valid(phone: str, session_string: str = None) -> Tuple[bool, Optional[str]]:
+    client = None
+    try:
+        client = TelegramClient(
+            StringSession(session_string) if session_string else StringSession(),
+            API_ID, API_HASH
+        )
+        await client.connect()
+        if not await client.is_user_authorized():
+            return False, None
+        return True, StringSession.save(client.session)
+    except Exception as e:
+        logger.error(f"Error checking account {phone}: {e}")
+        return False, None
+    finally:
+        if client:
+            await client.disconnect()
+
+async def get_login_code_from_account(account_id: int) -> Optional[str]:
+    account = await get_account_by_id(account_id)
+    if not account or not account['session_string']:
+        return None
+    client = None
+    try:
+        client = TelegramClient(StringSession(account['session_string']), API_ID, API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            return None
+        telegram_chat = None
+        async for dialog in client.iter_dialogs():
+            if dialog.name == "Telegram" and dialog.is_user:
+                telegram_chat = dialog
+                break
+        if not telegram_chat:
+            return None
+        messages = await client.get_messages(telegram_chat.id, limit=5)
+        for message in messages:
+            if message.text and re.search(r'\b\d{5}\b', message.text):
+                return re.search(r'\b\d{5}\b', message.text).group()
+        return None
+    except Exception as e:
+        logger.error(f"Error getting code for account {account_id}: {e}")
+        return None
+    finally:
+        if client:
+            await client.disconnect()
+
+# --- Страны ---
+COUNTRIES = [
+    "🇷🇺 Россия", "🇺🇦 Украина", "🇧🇾 Беларусь", "🇰🇿 Казахстан", "🇺🇿 Узбекистан",
+    "🇹🇯 Таджикистан", "🇰🇬 Кыргызстан", "🇦🇿 Азербайджан", "🇦🇲 Армения", "🇬🇪 Грузия",
+    "🇲🇩 Молдова", "🇹🇲 Туркменистан", "🇩🇪 Германия", "🇫🇷 Франция", "🇬🇧 Великобритания",
+    "🇺🇸 США", "🇨🇦 Канада", "🇹🇷 Турция", "🇵🇱 Польша", "🇮🇹 Италия",
+    "🇪🇸 Испания", "🇳🇱 Нидерланды", "🇧🇪 Бельгия", "🇨🇿 Чехия", "🇸🇪 Швеция",
+    "🇳🇴 Норвегия", "🇩🇰 Дания", "🇫🇮 Финляндия", "🇵🇹 Португалия", "🇬🇷 Греция",
+    "🇨🇭 Швейцария", "🇦🇹 Австрия", "🇷🇸 Сербия", "🇧🇬 Болгария", "🇷🇴 Румыния",
+    "🇭🇺 Венгрия", "🇮🇳 Индия", "🇧🇷 Бразилия", "🇦🇷 Аргентина", "🇲🇽 Мексика",
+    "🇯🇵 Япония", "🇰🇷 Южная Корея", "🇦🇪 ОАЭ", "🇮🇱 Израиль", "🇪🇪 Эстония"
+]
+
+# --- FSM ---
+class AdminStates(StatesGroup):
+    broadcast_text = State()
+    broadcast_confirm = State()
+    change_balance_user = State()
+    change_balance_amount = State()
+    change_price_country = State()
+    change_price_value = State()
+    upload_media_section = State()
+
+# --- Клавиатуры ---
+def get_main_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="Купить аккаунт", callback_data="buy_account", style="primary", icon_custom_emoji_id="5884479287171485878"))
+    builder.row(InlineKeyboardButton(text="Мои покупки", callback_data="my_purchases", style="default", icon_custom_emoji_id="5870528606328852614"))
+    builder.row(InlineKeyboardButton(text="Профиль", callback_data="profile", style="default", icon_custom_emoji_id="5891207662678317861"))
+    return builder.as_markup()
+
+def get_countries_keyboard(page: int = 0) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    items_per_page = 10
+    start_idx = page * items_per_page
+    end_idx = start_idx + items_per_page
+    for country in COUNTRIES[start_idx:end_idx]:
+        builder.row(InlineKeyboardButton(text=country, callback_data=f"country_{country}", style="default", icon_custom_emoji_id="5870528606328852614"))
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="Назад", callback_data=f"countries_page_{page - 1}", style="default", icon_custom_emoji_id="5893057118545646106"))
+    if end_idx < len(COUNTRIES):
+        nav_buttons.append(InlineKeyboardButton(text="Вперед", callback_data=f"countries_page_{page + 1}", style="default", icon_custom_emoji_id="5893057118545646106"))
+    if nav_buttons:
+        builder.row(*nav_buttons)
+    builder.row(InlineKeyboardButton(text="Главное меню", callback_data="main_menu", style="primary", icon_custom_emoji_id="5873147866364514353"))
+    return builder.as_markup()
+
+def get_payment_keyboard(account_id: int, amount: float) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text=f"Оплатить {int(amount)} ⭐", callback_data=f"pay_stars_{account_id}", style="primary", icon_custom_emoji_id="5904462880941545555"))
+    builder.row(InlineKeyboardButton(text=f"Оплатить {amount:.2f}₽ (Crypto Bot)", callback_data=f"pay_crypto_{account_id}", style="success", icon_custom_emoji_id="5260752406890711732"))
+    builder.row(InlineKeyboardButton(text=f"Оплатить с баланса ({amount:.2f}₽)", callback_data=f"pay_balance_{account_id}", style="default", icon_custom_emoji_id="5769126056262898415"))
+    builder.row(InlineKeyboardButton(text="Отмена", callback_data=f"cancel_purchase_{account_id}", style="danger", icon_custom_emoji_id="5870657884844462243"))
+    return builder.as_markup()
+
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="Статистика", callback_data="admin_stats", style="primary", icon_custom_emoji_id="5870930636742595124"))
+    builder.row(InlineKeyboardButton(text="Рассылка", callback_data="admin_broadcast", style="default", icon_custom_emoji_id="6039422865189638057"))
+    builder.row(InlineKeyboardButton(text="Изменить баланс", callback_data="admin_change_balance", style="default", icon_custom_emoji_id="5769126056262898415"))
+    builder.row(InlineKeyboardButton(text="Изменить цены", callback_data="admin_change_price", style="default", icon_custom_emoji_id="5870676941614354370"))
+    builder.row(InlineKeyboardButton(text="Загрузить медиа", callback_data="admin_upload_media", style="default", icon_custom_emoji_id="6035128606563241721"))
+    builder.row(InlineKeyboardButton(text="Закрыть", callback_data="admin_close", style="danger", icon_custom_emoji_id="5870657884844462243"))
+    return builder.as_markup()
+
+def get_code_keyboard(purchase_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="Получить код", callback_data=f"get_code_{purchase_id}", style="primary", icon_custom_emoji_id="6037249452824072506"))
+    builder.row(InlineKeyboardButton(text="Назад", callback_data="my_purchases", style="default", icon_custom_emoji_id="5893057118545646106"))
+    return builder.as_markup()
+
+# --- Инициализация бота ---
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+dp.include_router(router)
+
+# --- Хендлеры ---
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    await create_user(message.from_user.id, message.from_user.username)
+    await message.answer(
+        f"<tg-emoji emoji-id='5873147866364514353'>🏘</tg-emoji> <b>Добро пожаловать в Vest Market!</b>\n\n"
+        f"<tg-emoji emoji-id='5870528606328852614'>📁</tg-emoji> Здесь ты можешь купить Telegram аккаунты разных стран.\n\n"
+        f"<tg-emoji emoji-id='5904462880941545555'>🪙</tg-emoji> Выбери действие в меню:",
+        reply_markup=get_main_keyboard()
+    )
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("<tg-emoji emoji-id='5870657884844462243'>❌</tg-emoji> <b>У вас нет доступа!</b>")
+        return
+    await state.clear()
+    await message.answer("<tg-emoji emoji-id='5870982283724328568'>⚙</tg-emoji> <b>Админ панель</b>\n\nВыберите действие:", reply_markup=get_admin_keyboard())
+
+@router.callback_query(F.data == "main_menu")
+async def callback_main_menu(callback: CallbackQuery):
+    await callback.message.edit_text("<tg-emoji emoji-id='5873147866364514353'>🏘</tg-emoji> <b>Главное меню</b>\n\nВыберите действие:", reply_markup=get_main_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data == "buy_account")
+async def callback_buy_account(callback: CallbackQuery):
+    await callback.message.edit_text("<tg-emoji emoji-id='5870528606328852614'>📁</tg-emoji> <b>Выберите страну:</b>\n\nВыберите страну аккаунта, который хотите купить:", reply_markup=get_countries_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("countries_page_"))
+async def callback_countries_page(callback: CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    await callback.message.edit_text("<tg-emoji emoji-id='5870528606328852614'>📁</tg-emoji> <b>Выберите страну:</b>", reply_markup=get_countries_keyboard(page))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("country_"))
+async def callback_country_selected(callback: CallbackQuery):
+    country = callback.data.replace("country_", "")
+    await callback.message.edit_text(f"<tg-emoji emoji-id='5345906554510012647'>🔄</tg-emoji> <b>Ищу аккаунт {country}...</b>\n\nПожалуйста, подождите немного.")
+    await callback.answer()
+    await asyncio.sleep(1)
+    account = await get_free_account(country)
+    if not account:
+        await callback.message.edit_text(f"<tg-emoji emoji-id='5870657884844462243'>❌</tg-emoji> <b>Аккаунты в {country} закончились!</b>\n\nПопробуйте выбрать другую страну.", reply_markup=get_countries_keyboard())
+        return
+    is_valid, _ = await check_account_valid(account['phone'], account['session_string'])
+    if not is_valid:
+        await callback.message.edit_text(f"<tg-emoji emoji-id='5870657884844462243'>❌</tg-emoji> <b>Аккаунт {country} невалидный!</b>\n\nПопробуйте выбрать другую страну.", reply_markup=get_countries_keyboard())
+        return
+    if not await reserve_account(account['id'], callback.from_user.id):
+        await callback.message.edit_text(f"<tg-emoji emoji-id='5870657884844462243'>❌</tg-emoji> <b>Не удалось зарезервировать аккаунт!</b>\n\nПопробуйте ещё раз.", reply_markup=get_countries_keyboard())
+        return
+    price = await get_price(country)
+    asyncio.create_task(release_account_after_timeout(account['id'], 300))
+    await callback.message.edit_text(
+        f"<tg-emoji emoji-id='5870633910337015697'>✅</tg-emoji> <b>Аккаунт найден!</b>\n\n"
+        f"<tg-emoji emoji-id='5870528606328852614'>📁</tg-emoji> Страна: {country}\n"
+        f"<tg-emoji emoji-id='5904462880941545555'>🪙</tg-emoji> Цена: {price:.2f}₽\n\n<b>Выберите способ оплаты:</b>",
+        reply_markup=get_payment_keyboard(account['id'], price)
+    )
+
+async def release_account_after_timeout(account_id: int, seconds: int):
+    await asyncio.sleep(seconds)
+    await release_account(account_id)
+
+@router.callback_query(F.data.startswith("cancel_purchase_"))
+async def callback_cancel_purchase(callback: CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    await release_account(account_id)
+    await callback.message.edit_text("<tg-emoji emoji-id='5870657884844462243'>❌</tg-emoji> <b>Покупка отменена!</b>\n\nАккаунт возвращён в список доступных.", reply_markup=get_main_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("pay_stars_"))
+async def callback_pay_stars(callback: CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    account = await get_account_by_id(account_id)
+    if not account:
+        await callback.answer("❌ Аккаунт не найден!", show_alert=True)
+        return
+    price = await get_price(account['country'])
+    await callback.message.answer_invoice(
+        title="Покупка Telegram аккаунта",
+        description=f"Аккаунт {account['country']} | Vest Market",
+        payload=f"stars_{account_id}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"Аккаунт {account['country']}", amount=int(price))]
+    )
+    await callback.answer()
+
+@router.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await pre_checkout_query.answer(ok=True)
+
+@router.message(F.content_type == types.ContentType.SUCCESSFUL_PAYMENT)
+async def process_successful_payment(message: Message):
+    payload = message.successful_payment.invoice_payload
+    if payload.startswith("stars_"):
+        account_id = int(payload.split("_")[1])
+        account = await get_account_by_id(account_id)
+        if not account:
+            await message.answer("❌ <b>Аккаунт не найден!</b>")
+            return
+        price = await get_price(account['country'])
+        await mark_account_sold(account_id, message.from_user.id, price)
+        await message.answer(
+            f"✅ <b>Оплата прошла успешно!</b>\n\n"
+            f"📁 Номер: {account['phone']}\n"
+            f"👤 Страна: {account['country']}\n\n"
+            f"🔒 2FA: {'Да' if account['password_2fa'] else 'Нет'}\n\n",
+            reply_markup=get_main_keyboard()
+        )
+
+@router.callback_query(F.data.startswith("pay_balance_"))
+async def callback_pay_balance(callback: CallbackQuery):
+    account_id = int(callback.data.split("_")[2])
+    account = await get_account_by_id(account_id)
+    if not account:
+        await callback.answer("❌ Аккаунт не найден!", show_alert=True)
+        return
+    price = await get_price(account['country'])
+    user = await get_user(callback.from_user.id)
+    if user['balance'] < price:
+        await callback.answer("❌ Недостаточно средств на балансе!", show_alert=True)
+        return
+    await update_balance(callback.from_user.id, -price)
+    await mark_account_sold(account_id, callback.from_user.id, price)
+    await callback.message.edit_text(
+        f"✅ <b>Покупка успешна!</b>\n\n"
+        f"📁 Номер: {account['phone']}\n"
+        f"👤 Страна: {account['country']}\n"
+        f"🔒 2FA: {'Да' if account['password_2fa'] else 'Нет'}\n\n"
+        f"👛 Ваш баланс: {user['balance'] - price:.2f}₽",
+        reply_markup=get_main_keyboard()
+    )
+    await callback.answer("✅ Покупка успешна!", show_alert=True)
+
+@router.callback_query(F.data == "profile")
+async def callback_profile(callback: CallbackQuery):
+    user = await get_user(callback.from_user.id)
+    await callback.message.edit_text(
+        f"<tg-emoji emoji-id='5891207662678317861'>👤</tg-emoji> <b>Ваш профиль</b>\n\n"
+        f"<tg-emoji emoji-id='5769126056262898415'>👛</tg-emoji> Баланс: {user['balance']:.2f}₽\n"
+        f"<tg-emoji emoji-id='5884479287171485878'>📦</tg-emoji> Куплено аккаунтов: {user['total_purchases']}\n"
+        f"<tg-emoji emoji-id='5890937706803894250'>📅</tg-emoji> Дата регистрации: {user['created_at'].strftime('%d.%m.%Y')}",
+        reply_markup=get_main_keyboard()
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "my_purchases")
+async def callback_my_purchases(callback: CallbackQuery):
+    purchases = await get_user_purchases(callback.from_user.id)
+    if not purchases:
+        await callback.message.edit_text("<tg-emoji emoji-id='5870528606328852614'>📁</tg-emoji> <b>Мои покупки</b>\n\nУ вас пока нет купленных аккаунтов.", reply_markup=get_main_keyboard())
+        await callback.answer()
+        return
+    builder = InlineKeyboardBuilder()
+    for p in purchases:
+        builder.row(InlineKeyboardButton(text=f"{p['phone']} | {p['country']}", callback_data=f"purchase_{p['id']}", style="default", icon_custom_emoji_id="5870528606328852614"))
+    builder.row(InlineKeyboardButton(text="Главное меню", callback_data="main_menu", style="primary", icon_custom_emoji_id="5873147866364514353"))
+    await callback.message.edit_text("<tg-emoji emoji-id='5870528606328852614'>📁</tg-emoji> <b>Мои покупки</b>\n\nНажмите на аккаунт, чтобы получить код:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("purchase_"))
+async def callback_purchase_detail(callback: CallbackQuery):
+    purchase_id = int(callback.data.split("_")[1])
+    purchases = await get_user_purchases(callback.from_user.id)
+    purchase = next((p for p in purchases if p['id'] == purchase_id), None)
+    if not purchase:
+        await callback.answer("❌ Покупка не найдена!", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"<tg-emoji emoji-id='5870528606328852614'>📁</tg-emoji> <b>Аккаунт</b>\n\n"
+        f"<tg-emoji emoji-id='5884479287171485878'>📦</tg-emoji> Номер: {purchase['phone']}\n"
+        f"<tg-emoji emoji-id='5891207662678317861'>👤</tg-emoji> Страна: {purchase['country']}\n"
+        f"<tg-emoji emoji-id='6037249452824072506'>🔒</tg-emoji> 2FA: {'Да' if purchase['password_2fa'] else 'Нет'}\n"
+        f"<tg-emoji emoji-id='5890937706803894250'>📅</tg-emoji> Дата: {purchase['purchase_date'].strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"<tg-emoji emoji-id='6037249452824072506'>🔒</tg-emoji> Код получен: {'Да' if purchase['code_obtained'] else 'Нет'}",
+        reply_markup=get_code_keyboard(purchase_id)
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("get_code_"))
+async def callback_get_code(callback: CallbackQuery):
+    purchase_id = int(callback.data.split("_")[2])
+    purchases = await get_user_purchases(callback.from_user.id)
+    purchase = next((p for p in purchases if p['id'] == purchase_id), None)
+    if not purchase:
+        await callback.answer("❌ Покупка не найдена!", show_alert=True)
+        return
+    if purchase['code_obtained']:
+        await callback.answer("ℹ Код уже был получен!", show_alert=True)
+        return
+    await callback.message.edit_text(f"<tg-emoji emoji-id='5345906554510012647'>🔄</tg-emoji> <b>Получаю код...</b>\n\nПожалуйста, подождите.")
+    await callback.answer()
+    code = await get_login_code_from_account(purchase['account_id'])
+    if not code:
+        await callback.message.edit_text(f"<tg-emoji emoji-id='5870657884844462243'>❌</tg-emoji> <b>Не удалось получить код!</b>\n\nПопробуйте ещё раз позже.", reply_markup=get_code_keyboard(purchase_id))
+        return
+    await mark_code_obtained(purchase_id)
+    await callback.message.edit_text(
+        f"<tg-emoji emoji-id='5870633910337015697'>✅</tg-emoji> <b>Код получен!</b>\n\n"
+        f"<tg-emoji emoji-id='6037249452824072506'>🔒</tg-emoji> Ваш код: <code>{code}</code>\n\n"
+        f"<tg-emoji emoji-id='6028435952299413210'>ℹ</tg-emoji> Код действителен в течение нескольких минут.",
+        reply_markup=get_main_keyboard()
+    )
+
+# --- Админ хендлеры ---
+@router.callback_query(F.data == "admin_stats")
+async def callback_admin_stats(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    stats = await get_stats()
+    await callback.message.edit_text(
+        f"<tg-emoji emoji-id='5870930636742595124'>📊</tg-emoji> <b>Статистика</b>\n\n"
+        f"👥 Всего пользователей: {stats['total_users']}\n"
+        f"📦 Всего аккаунтов: {stats['total_accounts']}\n"
+        f"✅ Продано: {stats['sold_accounts']}\n"
+        f"❌ Доступно: {stats['available_accounts']}",
+        reply_markup=get_admin_keyboard()
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_broadcast")
+async def callback_admin_broadcast(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "<tg-emoji emoji-id='6039422865189638057'>📣</tg-emoji> <b>Отправьте сообщение для рассылки:</b>\n\nМожно отправить текст, фото или видео с подписью.\nДля отмены нажмите кнопку ниже:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_close", style="danger", icon_custom_emoji_id="5870657884844462243")]])
+    )
+    await state.set_state(AdminStates.broadcast_text)
+    await callback.answer()
+
+@router.message(StateFilter(AdminStates.broadcast_text))
+async def admin_broadcast_message(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.update_data(
+        broadcast_text=message.text or message.caption or "",
+        broadcast_file_id=message.photo[-1].file_id if message.photo else (message.video.file_id if message.video else None),
+        broadcast_file_type="photo" if message.photo else ("video" if message.video else "text")
+    )
+    await state.set_state(AdminStates.broadcast_confirm)
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="Отправить", callback_data="broadcast_send", style="success", icon_custom_emoji_id="5870633910337015697"))
+    builder.row(InlineKeyboardButton(text="Отмена", callback_data="admin_close", style="danger", icon_custom_emoji_id="5870657884844462243"))
+    await message.answer("<tg-emoji emoji-id='6039422865189638057'>📣</tg-emoji> <b>Подтвердите рассылку</b>", reply_markup=builder.as_markup())
+
+@router.callback_query(F.data == "broadcast_send", StateFilter(AdminStates.broadcast_confirm))
+async def callback_broadcast_send(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    data = await state.get_data()
+    await state.clear()
+    users = await get_all_users()
+    success = failed = 0
+    for user in users:
+        try:
+            if data['broadcast_file_type'] == "text":
+                await bot.send_message(chat_id=user['id'], text=data['broadcast_text'])
+            elif data['broadcast_file_type'] == "photo":
+                await bot.send_photo(chat_id=user['id'], photo=data['broadcast_file_id'], caption=data['broadcast_text'])
+            elif data['broadcast_file_type'] == "video":
+                await bot.send_video(chat_id=user['id'], video=data['broadcast_file_id'], caption=data['broadcast_text'])
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            failed += 1
+            logger.error(f"Broadcast error: {e}")
+    await callback.message.edit_text(f"✅ <b>Рассылка завершена!</b>\n\n✅ Успешно: {success}\n❌ Не удалось: {failed}", reply_markup=get_admin_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_change_balance")
+async def callback_admin_change_balance(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    await callback.message.edit_text("<tg-emoji emoji-id='5769126056262898415'>👛</tg-emoji> <b>Введите ID пользователя:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_close", style="danger", icon_custom_emoji_id="5870657884844462243")]]))
+    await state.set_state(AdminStates.change_balance_user)
+    await callback.answer()
+
+@router.message(StateFilter(AdminStates.change_balance_user))
+async def admin_change_balance_user(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        user_id = int(message.text)
+    except ValueError:
+        await message.answer("❌ Неверный ID!")
+        return
+    user = await get_user(user_id)
+    if not user:
+        await message.answer("❌ Пользователь не найден!")
+        return
+    await state.update_data(change_balance_user=user_id)
+    await state.set_state(AdminStates.change_balance_amount)
+    await message.answer(f"👤 Пользователь: {user_id}\n👛 Текущий баланс: {user['balance']:.2f}₽\n\n🪙 <b>Введите сумму (+ или -):</b>")
+
+@router.message(StateFilter(AdminStates.change_balance_amount))
+async def admin_change_balance_amount(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        amount = float(message.text)
+    except ValueError:
+        await message.answer("❌ Неверная сумма!")
+        return
+    data = await state.get_data()
+    new_balance = await update_balance(data['change_balance_user'], amount)
+    await state.clear()
+    await message.answer(f"✅ Баланс изменён!\n👤 Пользователь: {data['change_balance_user']}\n👛 Новый баланс: {new_balance:.2f}₽", reply_markup=get_admin_keyboard())
+
+@router.callback_query(F.data == "admin_change_price")
+async def callback_admin_change_price(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    await callback.message.edit_text("🖋 <b>Выберите страну для изменения цены:</b>", reply_markup=get_countries_keyboard())
+    await state.set_state(AdminStates.change_price_country)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("country_"), StateFilter(AdminStates.change_price_country))
+async def callback_admin_change_price_country(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    country = callback.data.replace("country_", "")
+    await state.update_data(change_price_country=country)
+    await state.set_state(AdminStates.change_price_value)
+    current_price = await get_price(country)
+    await callback.message.edit_text(f"🖋 Страна: {country}\n🪙 Текущая цена: {current_price:.2f}₽\n\n<b>Введите новую цену:</b>")
+    await callback.answer()
+
+@router.message(StateFilter(AdminStates.change_price_value))
+async def admin_change_price_value(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        price = float(message.text)
+    except ValueError:
+        await message.answer("❌ Неверная цена!")
+        return
+    data = await state.get_data()
+    await set_price(data['change_price_country'], price)
+    await state.clear()
+    await message.answer(f"✅ Цена изменена!\n📁 Страна: {data['change_price_country']}\n🪙 Новая цена: {price:.2f}₽", reply_markup=get_admin_keyboard())
+
+@router.callback_query(F.data == "admin_upload_media")
+async def callback_admin_upload_media(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    builder = InlineKeyboardBuilder()
+    for name, section_id in [("Главное меню", "main_menu"), ("Профиль", "profile"), ("Мои покупки", "purchases")]:
+        builder.row(InlineKeyboardButton(text=name, callback_data=f"media_section_{section_id}", style="default", icon_custom_emoji_id="6035128606563241721"))
+    builder.row(InlineKeyboardButton(text="Отмена", callback_data="admin_close", style="danger", icon_custom_emoji_id="5870657884844462243"))
+    await callback.message.edit_text("<tg-emoji emoji-id='6035128606563241721'>🖼</tg-emoji> <b>Выберите раздел для загрузки медиа:</b>", reply_markup=builder.as_markup())
+    await state.set_state(AdminStates.upload_media_section)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("media_section_"), StateFilter(AdminStates.upload_media_section))
+async def callback_media_section(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    section = callback.data.replace("media_section_", "")
+    await state.update_data(upload_media_section=section)
+    await callback.message.edit_text(f"<tg-emoji emoji-id='6035128606563241721'>🖼</tg-emoji> <b>Отправьте фото или видео для раздела:</b> {section}\n\nМожно добавить подпись.")
+    await callback.answer()
+
+@router.message(StateFilter(AdminStates.upload_media_section))
+async def admin_upload_media_message(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    section = data['upload_media_section']
+    if message.photo:
+        file_id, file_type = message.photo[-1].file_id, "photo"
+    elif message.video:
+        file_id, file_type = message.video.file_id, "video"
+    else:
+        await message.answer("❌ Отправьте фото или видео!")
+        return
+    await set_media(section, file_id, file_type, message.caption or "")
+    await state.clear()
+    await message.answer(f"✅ Медиа загружено!\n🖼 Раздел: {section}", reply_markup=get_admin_keyboard())
+
+@router.callback_query(F.data == "admin_close")
+async def callback_admin_close(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text("<tg-emoji emoji-id='5873147866364514353'>🏘</tg-emoji> <b>Главное меню</b>", reply_markup=get_main_keyboard())
+    await callback.answer()
+
+# --- Запуск ---
+async def main():
+    init_db()
+    await bot(DeleteWebhook(drop_pending_updates=True))
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
